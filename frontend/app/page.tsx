@@ -2,6 +2,9 @@
 
 import { useState, useEffect, useRef, useMemo } from 'react';
 
+// API Base URL from environment variables or default to localhost
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
 // ==========================================
 // Types & Interfaces
 // ==========================================
@@ -349,7 +352,7 @@ export default function Home() {
       setLoadingProgress(`Fetching ${selectedYear} season schedule...`);
       setApiError(null);
       try {
-        const res = await fetch(`http://localhost:8000/api/schedule?year=${selectedYear}`);
+        const res = await fetch(`${API_BASE_URL}/api/schedule?year=${selectedYear}`);
         if (!res.ok) throw new Error(`HTTP error ${res.status}`);
         const data = await res.json();
         if (data.success && data.events) {
@@ -380,7 +383,7 @@ export default function Home() {
     async function fetchLiveSchedule() {
       const currentYear = new Date().getFullYear();
       try {
-        const res = await fetch(`http://localhost:8000/api/schedule?year=${currentYear}`);
+        const res = await fetch(`${API_BASE_URL}/api/schedule?year=${currentYear}`);
         if (!res.ok) throw new Error("Failed to fetch live schedule");
         const data = await res.json();
         if (data.success && data.events) {
@@ -441,7 +444,7 @@ export default function Home() {
     
     try {
       // 1. Fetch results
-      const resResults = await fetch(`http://localhost:8000/api/results?year=${year}&event=${encodeURIComponent(eventName)}&session=${sessionType}`);
+      const resResults = await fetch(`${API_BASE_URL}/api/results?year=${year}&event=${encodeURIComponent(eventName)}&session=${sessionType}`);
       if (!resResults.ok) throw new Error(`HTTP error fetching results: ${resResults.status}`);
       const dataResults = await resResults.json();
       if (!dataResults.success || !dataResults.results) {
@@ -450,7 +453,7 @@ export default function Home() {
       
       // 2. Fetch laps
       setLoadingProgress(`Loading lap-by-lap telemetry records for ${eventName}...`);
-      const resLaps = await fetch(`http://localhost:8000/api/laps?year=${year}&event=${encodeURIComponent(eventName)}&session=${sessionType}`);
+      const resLaps = await fetch(`${API_BASE_URL}/api/laps?year=${year}&event=${encodeURIComponent(eventName)}&session=${sessionType}`);
       if (!resLaps.ok) throw new Error(`HTTP error fetching laps: ${resLaps.status}`);
       const dataLaps = await resLaps.json();
       if (!dataLaps.success || !dataLaps.laps) {
