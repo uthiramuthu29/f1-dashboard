@@ -26,6 +26,7 @@ interface Driver {
   tyre: 'Soft' | 'Medium' | 'Hard' | 'Intermediate' | 'Wet';
   tyreAge: number;      // Laps on current tyre set
   bestLapTime: string;  // Best lap time in the race
+  currentLapCompleted?: number; // Last lap completed from telemetry
 }
 
 interface Track {
@@ -223,6 +224,39 @@ const parseLapTime = (timeString: string): number => {
   return parseInt(parts[0]) * 60 + parseFloat(parts[1]);
 };
 
+interface UpcomingSession {
+  eventName: string;
+  sessionName: string;
+  date: Date;
+}
+
+const findUpcomingSession = (events: any[]): UpcomingSession | null => {
+  const now = new Date();
+  let soonestSession: UpcomingSession | null = null;
+
+  events.forEach(event => {
+    for (let i = 1; i <= 5; i++) {
+      const sessionName = event[`Session${i}`];
+      const sessionDateUtc = event[`Session${i}DateUtc`];
+
+      if (sessionName && sessionName !== 'None' && sessionDateUtc) {
+        const sessionDate = new Date(sessionDateUtc + 'Z');
+        if (sessionDate > now) {
+          if (!soonestSession || sessionDate < soonestSession.date) {
+            soonestSession = {
+              eventName: event.EventName,
+              sessionName: sessionName,
+              date: sessionDate
+            };
+          }
+        }
+      }
+    }
+  });
+
+  return soonestSession;
+};
+
 // ==========================================
 // Main Component
 // ==========================================
@@ -246,6 +280,36 @@ export default function Home() {
   // Fastest Lap holder
   const [fastestLapHolder, setFastestLapHolder] = useState<{ driverId: string; time: string } | null>(null);
   
+  // Backend Integration States
+  const [selectedYear, setSelectedYear] = useState<number>(2024);
+  const [selectedSessionType, setSelectedSessionType] = useState<string>('R');
+  const [scheduleEvents, setScheduleEvents] = useState<any[]>([]);
+  const [selectedEventName, setSelectedEventName] = useState<string>('');
+  
+  // Loaded raw backend telemetry
+  const [resultsData, setResultsData] = useState<any[]>([]);
+  const [lapsData, setLapsData] = useState<any[]>([]);
+  
+  // Live Upcoming Session States
+  const [upcomingSession, setUpcomingSession] = useState<UpcomingSession | null>(null);
+  const [countdownText, setCountdownText] = useState<string>('');
+  
+  // Loading and Error states
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [loadingProgress, setLoadingProgress] = useState<string>('');
+  const [apiError, setApiError] = useState<string | null>(null);
+
+  // Helper to normalize compounds
+  const normalizeCompound = (rawCompound: string): 'Soft' | 'Medium' | 'Hard' | 'Intermediate' | 'Wet' => {
+    const comp = rawCompound ? rawCompound.toUpperCase() : 'MEDIUM';
+    if (comp.includes('SOFT')) return 'Soft';
+    if (comp.includes('MEDIUM')) return 'Medium';
+    if (comp.includes('HARD')) return 'Hard';
+    if (comp.includes('INTER') || comp.includes('WET_INT')) return 'Intermediate';
+    if (comp.includes('WET')) return 'Wet';
+    return 'Medium';
+  };
+
   // Refs to avoid stale closures in the simulation interval
   const driversRef = useRef(drivers);
   const selectedTrackRef = useRef(selectedTrack);
@@ -278,6 +342,208 @@ export default function Home() {
     }
   }, [commentary]);
 
+  // Fetch F1 Schedule for selected year
+  useEffect(() => {
+    async function fetchSchedule() {
+      setIsLoading(true);
+      setLoadingProgress(`Fetching ${selectedYear} season schedule...`);
+      setApiError(null);
+      try {
+        const res = await fetch(`http://localhost:8000/api/schedule?year=${selectedYear}`);
+        if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+        const data = await res.json();
+        if (data.success && data.events) {
+          // Filter out RoundNumber 0 or testing formats
+          const validEvents = data.events.filter((e: any) => e.F1ApiSupport && e.RoundNumber > 0);
+          setScheduleEvents(validEvents);
+          // Auto-select first event if exists
+          if (validEvents.length > 0) {
+            setSelectedEventName(validEvents[0].EventName);
+          } else {
+            setSelectedEventName('');
+          }
+        } else {
+          throw new Error(data.detail || "Failed to parse schedule");
+        }
+      } catch (err: any) {
+        console.error(err);
+        setApiError(`Failed to load ${selectedYear} season schedule. Make sure the backend server is running.`);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+    fetchSchedule();
+  }, [selectedYear]);
+
+  // Fetch live upcoming session on mount
+  useEffect(() => {
+    async function fetchLiveSchedule() {
+      const currentYear = new Date().getFullYear();
+      try {
+        const res = await fetch(`http://localhost:8000/api/schedule?year=${currentYear}`);
+        if (!res.ok) throw new Error("Failed to fetch live schedule");
+        const data = await res.json();
+        if (data.success && data.events) {
+          const soonest = findUpcomingSession(data.events);
+          setUpcomingSession(soonest);
+        }
+      } catch (err) {
+        console.error("Failed to load upcoming live session:", err);
+      }
+    }
+    fetchLiveSchedule();
+  }, []);
+
+  // Update upcoming session countdown timer every second
+  useEffect(() => {
+    if (!upcomingSession) return;
+
+    const updateCountdown = () => {
+      const now = new Date();
+      const diffMs = upcomingSession.date.getTime() - now.getTime();
+
+      if (diffMs <= 0) {
+        setCountdownText('SESSION LIVE');
+      } else {
+        const secs = Math.floor(diffMs / 1000) % 60;
+        const mins = Math.floor(diffMs / (1000 * 60)) % 60;
+        const hours = Math.floor(diffMs / (1000 * 60 * 60)) % 24;
+        const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+        let text = '';
+        if (days > 0) text += `${days}d `;
+        text += `${hours.toString().padStart(2, '0')}h `;
+        text += `${mins.toString().padStart(2, '0')}m `;
+        text += `${secs.toString().padStart(2, '0')}s`;
+
+        setCountdownText(text);
+      }
+    };
+
+    updateCountdown();
+    const interval = setInterval(updateCountdown, 1000);
+
+    return () => clearInterval(interval);
+  }, [upcomingSession]);
+
+  // Load GP results and laps
+  const loadRaceTelemetry = async (year: number, eventName: string, sessionType: string) => {
+    if (!eventName) return;
+    setIsLoading(true);
+    setLoadingProgress(`Downloading session results and historical telemetry for ${eventName} (${year} - ${sessionType === 'R' ? 'Race' : sessionType === 'Q' ? 'Qualifying' : sessionType === 'S' ? 'Sprint' : 'Practice'})... (This may take a moment if the cache is cold)`);
+    setApiError(null);
+    setIsPlaying(false);
+    setLap(0);
+    setFastestLapHolder(null);
+    setCommentary([
+      { id: 'start', lap: 0, text: `🏁 Initializing playback for ${year} ${eventName} [${sessionType}]. Ready to start!`, type: 'normal' }
+    ]);
+    
+    try {
+      // 1. Fetch results
+      const resResults = await fetch(`http://localhost:8000/api/results?year=${year}&event=${encodeURIComponent(eventName)}&session=${sessionType}`);
+      if (!resResults.ok) throw new Error(`HTTP error fetching results: ${resResults.status}`);
+      const dataResults = await resResults.json();
+      if (!dataResults.success || !dataResults.results) {
+        throw new Error(dataResults.detail || "Failed to load results");
+      }
+      
+      // 2. Fetch laps
+      setLoadingProgress(`Loading lap-by-lap telemetry records for ${eventName}...`);
+      const resLaps = await fetch(`http://localhost:8000/api/laps?year=${year}&event=${encodeURIComponent(eventName)}&session=${sessionType}`);
+      if (!resLaps.ok) throw new Error(`HTTP error fetching laps: ${resLaps.status}`);
+      const dataLaps = await resLaps.json();
+      if (!dataLaps.success || !dataLaps.laps) {
+        throw new Error(dataLaps.detail || "Failed to load laps");
+      }
+      
+      const results = dataResults.results;
+      const laps = dataLaps.laps;
+      
+      setResultsData(results);
+      setLapsData(laps);
+      
+      // 3. Initialize dynamic track structure
+      const maxLaps = Math.max(...results.map((r: any) => r.Laps || 0));
+      const firstResult = results[0] || {};
+      
+      const newTrack: Track = {
+        name: eventName,
+        location: firstResult.CountryCode || 'Global',
+        laps: maxLaps > 0 ? maxLaps : 50,
+        length: 'Dynamic',
+        baseLapTime: 0,
+        rainChance: 0,
+        overtakeDifficulty: 1,
+        dnfChance: 0,
+        record: '-',
+        recordHolder: '-'
+      };
+      setSelectedTrack(newTrack);
+      
+      // 4. Initialize drivers state from results (Sorted by GridPosition for Race/Sprint, otherwise Position)
+      const startingDrivers: Driver[] = results.map((r: any, idx: number) => {
+        const teamColorHex = r.TeamColor ? `#${r.TeamColor}` : '#94A3B8';
+        const gp = sessionType === 'R' || sessionType === 'S'
+          ? (parseInt(r.GridPosition) || 20)
+          : (parseInt(r.Position) || idx + 1);
+        
+        // Find compound from first stint in laps data if possible
+        const driverLaps = laps.filter((l: any) => l.Driver === r.Abbreviation && l.LapNumber === 1);
+        const startCompoundRaw = driverLaps[0]?.Compound || 'MEDIUM';
+        const startCompound = normalizeCompound(startCompoundRaw);
+        
+        return {
+          id: r.DriverId || r.Abbreviation.toLowerCase(),
+          name: r.FullName || r.BroadcastName,
+          shortName: r.Abbreviation,
+          number: parseInt(r.DriverNumber) || 0,
+          team: r.TeamName,
+          teamColor: teamColorHex,
+          points: 0,
+          gridPosition: gp,
+          position: gp,
+          prevPosition: gp,
+          raceTime: gp * 0.8,
+          gap: gp * 0.8,
+          gapToLeader: gp === 1 ? 'LEADER' : `+${(gp * 0.8).toFixed(3)}`,
+          fastestLap: false,
+          dnf: false,
+          isPitting: false,
+          tyre: startCompound,
+          tyreAge: 0,
+          bestLapTime: '-',
+          currentLapCompleted: 0
+        };
+      }).sort((a: Driver, b: Driver) => {
+        return (sessionType === 'R' || sessionType === 'S')
+          ? a.gridPosition - b.gridPosition
+          : a.position - b.position;
+      });
+      
+      // Re-assign position indices from 1 to N
+      startingDrivers.forEach((d, idx) => {
+        d.position = idx + 1;
+        d.prevPosition = idx + 1;
+      });
+      
+      setDrivers(startingDrivers);
+      
+    } catch (err: any) {
+      console.error(err);
+      setApiError(`Failed to load telemetry for ${eventName} (${year}): ${err.message}. Please verify the backend is running.`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Load race data when selectedEventName, selectedYear, or selectedSessionType changes
+  useEffect(() => {
+    if (selectedEventName) {
+      loadRaceTelemetry(selectedYear, selectedEventName, selectedSessionType);
+    }
+  }, [selectedEventName, selectedYear, selectedSessionType]);
+
   // Reset function
   const handleReset = () => {
     setIsPlaying(false);
@@ -288,25 +554,76 @@ export default function Home() {
     setScLapsRemaining(0);
     setFastestLapHolder(null);
     
-    // Reset drivers back to starting grid points
-    const reset = INITIAL_DRIVERS.map(d => ({
-      ...d,
-      raceTime: d.gridPosition * 0.8, // Initial spacing at start
-      gap: d.gridPosition * 0.8,
-      gapToLeader: d.gridPosition === 1 ? 'LEADER' : `+${(d.gridPosition * 0.8).toFixed(3)}`,
-      position: d.gridPosition,
-      prevPosition: d.gridPosition,
-      fastestLap: false,
-      dnf: false,
-      isPitting: false,
-      tyre: 'Medium' as const,
-      tyreAge: 0,
-      bestLapTime: '-'
-    }));
-    setDrivers(reset);
-    setCommentary([
-      { id: `reset-${Date.now()}`, lap: 0, text: `🔄 Simulation reset for the ${selectedTrack.name}. Drivers are on grid!`, type: 'normal' }
-    ]);
+    if (resultsData.length > 0) {
+      const startingDrivers: Driver[] = resultsData.map((r: any, idx: number) => {
+        const teamColorHex = r.TeamColor ? `#${r.TeamColor}` : '#94A3B8';
+        const gp = selectedSessionType === 'R' || selectedSessionType === 'S'
+          ? (parseInt(r.GridPosition) || 20)
+          : (parseInt(r.Position) || idx + 1);
+        
+        // Find compound from first stint in laps data if possible
+        const driverLaps = lapsData.filter((l: any) => l.Driver === r.Abbreviation && l.LapNumber === 1);
+        const startCompoundRaw = driverLaps[0]?.Compound || 'MEDIUM';
+        const startCompound = normalizeCompound(startCompoundRaw);
+        
+        return {
+          id: r.DriverId || r.Abbreviation.toLowerCase(),
+          name: r.FullName || r.BroadcastName,
+          shortName: r.Abbreviation,
+          number: parseInt(r.DriverNumber) || 0,
+          team: r.TeamName,
+          teamColor: teamColorHex,
+          points: 0,
+          gridPosition: gp,
+          position: gp,
+          prevPosition: gp,
+          raceTime: gp * 0.8,
+          gap: gp * 0.8,
+          gapToLeader: gp === 1 ? 'LEADER' : `+${(gp * 0.8).toFixed(3)}`,
+          fastestLap: false,
+          dnf: false,
+          isPitting: false,
+          tyre: startCompound,
+          tyreAge: 0,
+          bestLapTime: '-',
+          currentLapCompleted: 0
+        };
+      }).sort((a: Driver, b: Driver) => {
+        return (selectedSessionType === 'R' || selectedSessionType === 'S')
+          ? a.gridPosition - b.gridPosition
+          : a.position - b.position;
+      });
+      
+      startingDrivers.forEach((d, idx) => {
+        d.position = idx + 1;
+        d.prevPosition = idx + 1;
+      });
+      
+      setDrivers(startingDrivers);
+      setCommentary([
+        { id: `reset-${Date.now()}`, lap: 0, text: `🔄 Simulation reset for ${selectedYear} ${selectedEventName}. Drivers are on grid!`, type: 'normal' }
+      ]);
+    } else {
+      // Fallback to initial drivers if no backend data loaded yet
+      const reset = INITIAL_DRIVERS.map(d => ({
+        ...d,
+        raceTime: d.gridPosition * 0.8,
+        gap: d.gridPosition * 0.8,
+        gapToLeader: d.gridPosition === 1 ? 'LEADER' : `+${(d.gridPosition * 0.8).toFixed(3)}`,
+        position: d.gridPosition,
+        prevPosition: d.gridPosition,
+        fastestLap: false,
+        dnf: false,
+        isPitting: false,
+        tyre: 'Medium' as const,
+        tyreAge: 0,
+        bestLapTime: '-'
+      }));
+      setDrivers(reset);
+      setCommentary([
+        { id: `reset-${Date.now()}`, lap: 0, text: `🔄 Simulation reset for the ${selectedTrack.name}. Drivers are on grid!`, type: 'normal' }
+      ]);
+    }
   };
 
   // Change Track handler
@@ -356,16 +673,13 @@ export default function Home() {
   };
 
   // ==========================================
-  // Core Simulation Physics Step
+  // Core Simulation Playback Tick
   // ==========================================
   const runSimulationTick = () => {
     const currentLap = lapRef.current;
     const currentTrack = selectedTrackRef.current;
     const currentDrivers = [...driversRef.current];
-    const currentSC = safetyCarRef.current;
-    const currentScLaps = scLapsRemainingRef.current;
-    const currentWet = wetnessRef.current;
-    const currentWeather = weatherRef.current;
+    const prevSC = safetyCarRef.current;
 
     // Check if race is finished
     if (currentLap >= currentTrack.laps) {
@@ -374,269 +688,162 @@ export default function Home() {
     }
 
     const nextLap = currentLap + 1;
-    setLap(nextLap);
-
-    // Weather transition checks
-    let nextWeather = currentWeather;
-    let nextWetness = currentWet;
-
-    if (currentWeather === 'Sunny') {
-      if (Math.random() < currentTrack.rainChance / 8) {
-        nextWeather = 'Overcast';
-        addCommentary("☁️ METEOROLOGY: Dark clouds grouping over the circuit. Sun covered.", 'weather');
-      }
-    } else if (currentWeather === 'Overcast') {
-      const roll = Math.random();
-      if (roll < 0.15) {
-        nextWeather = 'Rainy';
-        addCommentary("🌧️ WEATHER UPDATE: It's starting to rain! Track surface is becoming slippery.", 'weather');
-      } else if (roll > 0.85) {
-        nextWeather = 'Sunny';
-        addCommentary("☀️ WEATHER UPDATE: Clouds breaking. Sunshine drying the track surface.", 'weather');
-      }
-    } else if (currentWeather === 'Rainy') {
-      if (Math.random() < 0.10) {
-        nextWeather = 'Overcast';
-        addCommentary("🌤️ WEATHER UPDATE: Rain has stopped. A dry racing line should appear soon.", 'weather');
-      }
+    
+    // Get laps for this lap number
+    const lapRecords = lapsData.filter((l: any) => parseInt(l.LapNumber) === nextLap);
+    if (lapRecords.length === 0) {
+      // If we don't have records for this lap, we might have hit the end of the telemetry
+      setIsPlaying(false);
+      addCommentary(`🏁 CHECKERED FLAG: The race playback is complete!`, 'finish');
+      return;
     }
 
-    // Adjust track wetness based on weather
-    if (nextWeather === 'Rainy') {
-      nextWetness = Math.min(100, currentWet + 20);
-    } else if (nextWeather === 'Sunny') {
-      nextWetness = Math.max(0, currentWet - 15);
-    } else { // Overcast
-      nextWetness = Math.max(0, currentWet - 5);
+    setLap(nextLap);
+
+    // Weather transition checks based on tyres on track
+    let nextWeather: 'Sunny' | 'Overcast' | 'Rainy' = 'Sunny';
+    let nextWetness = 0;
+
+    const hasWet = lapRecords.some((l: any) => l.Compound && l.Compound.toUpperCase().includes('WET'));
+    const hasInter = lapRecords.some((l: any) => l.Compound && l.Compound.toUpperCase().includes('INTER'));
+
+    if (hasWet) {
+      nextWeather = 'Rainy';
+      nextWetness = 80;
+    } else if (hasInter) {
+      nextWeather = 'Rainy';
+      nextWetness = 40;
+    } else {
+      nextWeather = 'Sunny';
+      nextWetness = 0;
+    }
+
+    // Weather commentary logs
+    if (nextWeather !== weatherRef.current) {
+      if (nextWeather === 'Rainy') {
+        addCommentary(`🌧️ WEATHER UPDATE: Rain detected on circuit. Track wetness is ${nextWetness}%.`, 'weather');
+      } else {
+        addCommentary(`☀️ WEATHER UPDATE: Track is dry. Slick tyres are optimal.`, 'weather');
+      }
     }
     setWeather(nextWeather);
     setWetness(nextWetness);
 
-    // Safety Car lap progress
-    let nextSC = currentSC;
-    let nextScLaps = currentScLaps;
+    // Safety Car / VSC tracking from track status
+    let nextSC: 'None' | 'SC' | 'VSC' = 'None';
+    
+    // Look at first lap record TrackStatus
+    const statusString = lapRecords[0]?.TrackStatus || '1';
+    if (statusString.includes('4') || statusString.includes('5')) {
+      // 4 = Safety Car, 5 = Red Flag
+      nextSC = 'SC';
+    } else if (statusString.includes('6')) {
+      // 6 = Virtual Safety Car
+      nextSC = 'VSC';
+    }
 
-    if (currentSC !== 'None') {
-      if (currentScLaps <= 1) {
-        nextSC = 'None';
-        nextScLaps = 0;
-        addCommentary("🟢 SAFETY CAR IN: Safety car pits. GREEN FLAG! Racing resumes!", 'sc');
+    if (nextSC !== prevSC) {
+      if (nextSC === 'SC') {
+        addCommentary("⚠️ SAFETY CAR DEPLOYED: Speeds neutralized across the field.", 'sc');
+      } else if (nextSC === 'VSC') {
+        addCommentary("⚠️ VSC DEPLOYED: Virtual Safety Car active. Speeds neutralized.", 'sc');
       } else {
-        nextScLaps -= 1;
-        addCommentary(`🟡 SAFETY CAR: Circulating the track (Laps remaining: ${nextScLaps}). Pack compressed.`, 'sc');
-      }
-      setSafetyCar(nextSC);
-      setScLapsRemaining(nextScLaps);
-    }
-
-    // Check for random DNF (only when Safety car is NOT already active)
-    let triggeredDnfId = '';
-    if (nextSC === 'None' && Math.random() < currentTrack.dnfChance) {
-      const active = currentDrivers.filter(d => !d.dnf);
-      if (active.length > 3) {
-        // Pick random driver from P4 downward to keep podium competition stable but random
-        const dnfIdx = Math.floor(Math.random() * (active.length - 3)) + 3;
-        const targetDriver = active[dnfIdx];
-        triggeredDnfId = targetDriver.id;
-        
-        // Random crash details
-        const incidentTypes = [
-          "suffered an engine blow-out!",
-          "collided with the barrier at Turn 8!",
-          "retired in the pits with gearbox failure.",
-          "lost the rear and spun into the gravel trap!"
-        ];
-        const text = incidentTypes[Math.floor(Math.random() * incidentTypes.length)];
-        
-        addCommentary(`💥 RETIREMENT: ${targetDriver.name} has ${text}`, 'crash');
-        
-        // Deploy Safety Car or VSC
-        const isFullSc = Math.random() > 0.4;
-        nextSC = isFullSc ? 'SC' : 'VSC';
-        nextScLaps = isFullSc ? 3 : 2;
-        setSafetyCar(nextSC);
-        setScLapsRemaining(nextScLaps);
-        addCommentary(`⚠️ SIGNAL: ${nextSC} deployed. Speeds neutralized.`, 'sc');
+        addCommentary("🟢 GREEN FLAG: Safety car period ended. Racing resumes!", 'sc');
       }
     }
+    setSafetyCar(nextSC);
 
-    // Sort order based on previous position to calculate DRS
-    const sortedPrev = [...currentDrivers].sort((a, b) => a.position - b.position);
-
-    // Track best lap times this lap
+    // Check fastest lap this lap
     let lapFastestTime = Infinity;
-    let lapFastestHolder: Driver | null = null;
+    let lapFastestHolder: any = null;
 
-    // First pass: Calculate lap times for active drivers, check tyre pit stops
-    let updatedDrivers = currentDrivers.map(driver => {
-      // If DNF, stays in DNF
-      if (driver.id === triggeredDnfId) {
-        return {
-          ...driver,
-          dnf: true,
-          dnfOrder: nextDnfOrderRef.current,
-          position: 22,
-          isPitting: false,
-          gapToLeader: 'DNF'
-        };
+    lapRecords.forEach((record: any) => {
+      const lapTimeSec = parseFloat(record.LapTime);
+      if (lapTimeSec > 0 && lapTimeSec < lapFastestTime) {
+        lapFastestTime = lapTimeSec;
+        lapFastestHolder = record;
       }
-      if (driver.dnf) return driver;
-
-      // Base Lap Time
-      let lapTime = currentTrack.baseLapTime;
-
-      // Performance weights
-      lapTime += getDriverWeight(driver.id);
-      lapTime += getTeamWeight(driver.team);
-      
-      // Tyre wear penalty
-      lapTime += getTyreWearWeight(driver.tyre, driver.tyreAge);
-
-      // Weather penalty
-      lapTime += getWeatherPenalty(driver.tyre, nextWeather, nextWetness);
-
-      // DRS Boost: If trailing within 1.0s of car ahead, no SC, and dry conditions
-      const prevPosIdx = sortedPrev.findIndex(d => d.id === driver.id);
-      let drsActive = false;
-      if (prevPosIdx > 0 && nextSC === 'None' && nextWeather !== 'Rainy') {
-        const carAhead = sortedPrev[prevPosIdx - 1];
-        const gapToAhead = driver.raceTime - carAhead.raceTime;
-        if (gapToAhead > 0 && gapToAhead < 1.0 && !carAhead.dnf) {
-          lapTime -= 0.65; // DRS speed gain
-          drsActive = true;
-        }
-      }
-
-      // Random Lap fluctuation
-      lapTime += (Math.random() * 0.6) - 0.3;
-
-      // Safety Car speed cap
-      if (nextSC !== 'None') {
-        // Speeds are severely limited under SC/VSC
-        const scMultiplier = nextSC === 'SC' ? 1.45 : 1.25;
-        lapTime = currentTrack.baseLapTime * scMultiplier + (Math.random() * 0.3);
-      }
-
-      // ----------------------------------------
-      // Pit Stop Logic
-      // ----------------------------------------
-      let pittingThisLap = false;
-      let nextTyre = driver.tyre;
-      let nextTyreAge = driver.tyreAge + 1;
-
-      // Decisions to pit:
-      // 1. Wet track but on dry slick tyres
-      const wetTarmacNeedRainTyres = nextWetness > 40 && (driver.tyre === 'Soft' || driver.tyre === 'Medium' || driver.tyre === 'Hard');
-      // 2. Dry track but on wet weather tyres
-      const dryTarmacNeedSlicks = nextWetness <= 20 && (driver.tyre === 'Intermediate' || driver.tyre === 'Wet');
-      // 3. Tyres are heavily worn
-      const softWorn = driver.tyre === 'Soft' && driver.tyreAge > 12;
-      const medWorn = driver.tyre === 'Medium' && driver.tyreAge > 20;
-      const hardWorn = driver.tyre === 'Hard' && driver.tyreAge > 30;
-      const interWorn = driver.tyre === 'Intermediate' && driver.tyreAge > 18;
-      const wetWorn = driver.tyre === 'Wet' && driver.tyreAge > 18;
-      const tyreWorn = softWorn || medWorn || hardWorn || interWorn || wetWorn;
-
-      // Only pit if there are laps left (don't pit on final lap)
-      const lapsLeft = currentTrack.laps - nextLap;
-      
-      // If we need to pit and aren't already pitting, trigger pit lane entrance
-      if ((wetTarmacNeedRainTyres || dryTarmacNeedSlicks || tyreWorn) && lapsLeft > 0 && !driver.isPitting) {
-        pittingThisLap = true;
-        nextTyreAge = 0;
-
-        // Compound selection based on wetness
-        if (nextWetness > 65) {
-          nextTyre = 'Wet';
-        } else if (nextWetness > 30) {
-          nextTyre = 'Intermediate';
-        } else {
-          // Slick options
-          if (lapsLeft < 10) {
-            nextTyre = 'Soft';
-          } else if (lapsLeft < 22) {
-            nextTyre = 'Medium';
-          } else {
-            nextTyre = 'Hard';
-          }
-        }
-      }
-
-      // Clear pitting flag if they pitted in the previous tick
-      let wasPitting = driver.isPitting;
-      
-      let finalLapTime = lapTime;
-      if (pittingThisLap) {
-        finalLapTime += 21.5; // Adding pit-stop overhead
-        addCommentary(`🔧 PIT STOP: ${driver.name} comes in for fresh ${nextTyre} tyres.`, 'pit');
-      }
-
-      const newRaceTime = driver.raceTime + finalLapTime;
-
-      // Track personal best lap times (exclude pitting laps and safety car laps)
-      let newBestLapTime = driver.bestLapTime;
-      const pureLapTime = pittingThisLap ? lapTime : finalLapTime;
-      
-      if (!pittingThisLap && !wasPitting && nextSC === 'None') {
-        const currentBestSec = parseLapTime(driver.bestLapTime);
-        if (pureLapTime < currentBestSec) {
-          newBestLapTime = formatLapTime(pureLapTime);
-          if (pureLapTime < lapFastestTime) {
-            lapFastestTime = pureLapTime;
-            lapFastestHolder = { ...driver, bestLapTime: newBestLapTime, raceTime: newRaceTime };
-          }
-        }
-      }
-
-      return {
-        ...driver,
-        raceTime: newRaceTime,
-        tyre: pittingThisLap ? nextTyre : driver.tyre,
-        tyreAge: pittingThisLap ? 0 : nextTyreAge,
-        isPitting: pittingThisLap,
-        bestLapTime: newBestLapTime
-      };
     });
 
-    // ----------------------------------------
-    // Safety Car Compression Physics
-    // ----------------------------------------
-    if (nextSC !== 'None') {
-      // Sort active drivers under safety car to bunch them up
-      const active = updatedDrivers.filter(d => !d.dnf).sort((a, b) => a.raceTime - b.raceTime);
-      if (active.length > 0) {
-        const leader = active[0];
-        
-        // Loop and squash gaps (max gap under SC is compressed to 0.4s to 0.7s)
-        for (let i = 1; i < active.length; i++) {
-          const car = active[i];
-          const carAhead = active[i - 1];
-          const idealGap = 0.4 + (i * 0.05) + (Math.random() * 0.05); // compressed spacing
-          
-          // Modify the raceTime directly in updatedDrivers
-          const driverIdx = updatedDrivers.findIndex(d => d.id === car.id);
-          if (driverIdx !== -1) {
-            updatedDrivers[driverIdx].raceTime = carAhead.raceTime + idealGap;
-          }
-        }
+    // Update fastest lap holder
+    const currentGlobalFastestSec = fastestLapHolderRef.current 
+      ? parseLapTime(fastestLapHolderRef.current.time) 
+      : Infinity;
+      
+    if (lapFastestTime < currentGlobalFastestSec && lapFastestHolder) {
+      const driverObj = currentDrivers.find(d => d.shortName === lapFastestHolder.Driver);
+      if (driverObj) {
+        setFastestLapHolder({
+          driverId: driverObj.id,
+          time: formatLapTime(lapFastestTime)
+        });
+        addCommentary(`🟣 FASTEST LAP: ${driverObj.name} clocks a blistering ${formatLapTime(lapFastestTime)}!`, 'normal');
       }
     }
 
-    // ----------------------------------------
-    // Sort Standings & Check Overtakes
-    // ----------------------------------------
-    // Sort: Active drivers by raceTime, DNFs by dnfOrder at the bottom
+    // Update driver statuses
+    let updatedDrivers = currentDrivers.map(driver => {
+      if (driver.dnf) return driver;
+
+      const lapRecord = lapRecords.find((l: any) => l.Driver === driver.shortName);
+      const resultObj = resultsData.find((r: any) => r.Abbreviation === driver.shortName);
+
+      if (lapRecord) {
+        const lapTimeSec = parseFloat(lapRecord.LapTime);
+        const isPitting = lapRecord.PitInTime !== null && lapRecord.PitInTime !== undefined;
+        const compound = normalizeCompound(lapRecord.Compound);
+
+        if (isPitting && !driver.isPitting) {
+          addCommentary(`🔧 PIT STOP: ${driver.name} enters the pit lane for fresh ${compound} tyres.`, 'pit');
+        }
+
+        let newBestLapTime = driver.bestLapTime;
+        if (lapRecord.IsPersonalBest && lapTimeSec > 0) {
+          newBestLapTime = formatLapTime(lapTimeSec);
+        }
+
+        return {
+          ...driver,
+          position: parseInt(lapRecord.Position) || driver.position,
+          raceTime: parseFloat(lapRecord.Time) || driver.raceTime,
+          tyre: compound,
+          tyreAge: parseInt(lapRecord.TyreLife) || 0,
+          isPitting: isPitting,
+          bestLapTime: newBestLapTime,
+          currentLapCompleted: nextLap
+        };
+      } else {
+        // No record for this lap. Check if they retired (DNF) or are lapped.
+        const isDnf = resultObj && resultObj.Status !== 'Finished' && !resultObj.Status.startsWith('+');
+        if (isDnf) {
+          const retiredOrder = nextDnfOrderRef.current;
+          const statusReason = resultObj.Status || 'Technical Issue';
+          addCommentary(`💥 RETIREMENT: ${driver.name} has retired from the race (${statusReason}).`, 'crash');
+          return {
+            ...driver,
+            dnf: true,
+            dnfOrder: retiredOrder,
+            position: 22,
+            isPitting: false,
+            gapToLeader: 'DNF'
+          };
+        }
+        // Lapped driver: keep their previous details
+        return driver;
+      }
+    });
+
+    // Check for overtakes by comparing current positions with new positions
+    // Sort updated drivers to compute new standings
     let sortedStandings = [...updatedDrivers].sort((a, b) => {
       if (a.dnf && !b.dnf) return 1;
       if (!a.dnf && b.dnf) return -1;
       if (a.dnf && b.dnf) return (a.dnfOrder ?? 0) - (b.dnfOrder ?? 0);
-      return a.raceTime - b.raceTime;
+      return a.position - b.position;
     });
 
-    // Leader race time for gap calculations
     const leaderTime = sortedStandings.length > 0 ? sortedStandings[0].raceTime : 0;
 
-    // Second pass: Assign positions, calculate gaps, detect overtakes
     let finalDrivers = sortedStandings.map((driver, index) => {
       if (driver.dnf) {
         return {
@@ -648,58 +855,52 @@ export default function Home() {
       }
 
       const position = index + 1;
-      const prevPosition = driver.position;
+      const prevPosition = driver.prevPosition; // using previous loop's state
 
       // Calculate gap
-      const gap = driver.raceTime - leaderTime;
-      const gapToLeader = position === 1 ? 'LEADER' : `+${gap.toFixed(3)}`;
+      const lastCompleted = driver.currentLapCompleted || 0;
+      const lapsBehind = nextLap - lastCompleted;
+
+      let gap = driver.raceTime - leaderTime;
+      let gapToLeader = '';
+
+      if (position === 1) {
+        gapToLeader = 'LEADER';
+      } else if (lapsBehind > 0) {
+        gapToLeader = `+${lapsBehind} Lap${lapsBehind > 1 ? 's' : ''}`;
+      } else {
+        gapToLeader = `+${gap.toFixed(3)}`;
+      }
 
       // Overtake checks (only if not pitting, no safety car, and actually climbed positions)
       if (position < prevPosition && !driver.isPitting && nextSC === 'None') {
         const placesGained = prevPosition - position;
-        
-        // Find who they passed (looking at previous standings)
-        const driverAheadOld = sortedPrev[position - 1]; // who was at their new position previously
+        const driverAheadOld = currentDrivers.find(d => d.position === position);
         if (driverAheadOld && driverAheadOld.id !== driver.id && !driverAheadOld.dnf) {
           if (placesGained === 1) {
-            addCommentary(`⚔️ OVERTAKE: ${driver.name} makes a clean move past ${driverAheadOld.name} for P${position}!`, 'overtake');
+            addCommentary(`⚔️ OVERTAKE: ${driver.name} passes ${driverAheadOld.name} for P${position}!`, 'overtake');
           } else {
             addCommentary(`📈 ADVANCE: ${driver.name} gains ${placesGained} positions, moving up to P${position}.`, 'overtake');
           }
         }
       }
 
+      // Update the prevPosition to position for next loop iteration
       return {
         ...driver,
         position,
-        prevPosition,
+        prevPosition: position,
         gap,
         gapToLeader
       };
     });
 
     // Check if new global fastest lap is set
-    const holder = lapFastestHolder as Driver | null;
-    if (holder) {
-      const currentGlobalFastestSec = fastestLapHolderRef.current 
-        ? parseLapTime(fastestLapHolderRef.current.time) 
-        : Infinity;
-        
-      if (lapFastestTime < currentGlobalFastestSec) {
-        setFastestLapHolder({
-          driverId: holder.id,
-          time: formatLapTime(lapFastestTime)
-        });
-
-        // Set fastest lap flags
-        finalDrivers = finalDrivers.map(d => ({
-          ...d,
-          fastestLap: d.id === holder.id
-        }));
-
-        addCommentary(`🟣 FASTEST LAP: ${holder.name} clocks a blistering ${formatLapTime(lapFastestTime)}!`, 'normal');
-      }
-    }
+    const fastestLapId = fastestLapHolderRef.current?.driverId;
+    finalDrivers = finalDrivers.map(d => ({
+      ...d,
+      fastestLap: d.id === fastestLapId
+    }));
 
     setDrivers(finalDrivers);
 
@@ -713,25 +914,13 @@ export default function Home() {
         addCommentary(`🏆 PODIUM: 🥇 ${podium[0].name} | 🥈 ${podium[1].name} | 🥉 ${podium[2].name}`, 'finish');
       }
 
-      // Add points to season standings!
-      // 25, 18, 15, 12, 10, 8, 6, 4, 2, 1
-      const pointsDistribution = [25, 18, 15, 12, 10, 8, 6, 4, 2, 1];
+      // Update points distribution to reflect final results from the backend resultsData
       const updatedPointsDrivers = finalDrivers.map(d => {
-        if (d.dnf) return d;
-        let pointsEarned = 0;
-        if (d.position <= 10) {
-          pointsEarned += pointsDistribution[d.position - 1];
-        }
-        // Fastest lap bonus (+1 point if finishing in top 10)
-        if (d.fastestLap && d.position <= 10) {
-          pointsEarned += 1;
-          addCommentary(`✨ BONUS: ${d.name} scores +1 point for fastest lap!`, 'finish');
-        }
-
-        if (pointsEarned > 0) {
+        const resultObj = resultsData.find((r: any) => r.Abbreviation === d.shortName);
+        if (resultObj) {
           return {
             ...d,
-            points: d.points + pointsEarned
+            points: resultObj.Points || 0
           };
         }
         return d;
@@ -1019,10 +1208,10 @@ export default function Home() {
           </div>
           <div>
             <h1 className="text-xl font-bold tracking-tight text-white flex items-center gap-2">
-              Leaderboard & Live Race Simulator
+              Pitwall
             </h1>
             <p className="text-xs text-slate-400">
-              Interactive 22-Driver Position Telemetry Dashboard
+              Formuala 1 Telemetry Dashboard
             </p>
           </div>
         </div>
@@ -1048,18 +1237,34 @@ export default function Home() {
               {safetyCar === 'None' ? '🟢 GREEN FLAG' : `🟡 SAFETY CAR (${safetyCar})`}
             </span>
           </div>
+          {upcomingSession && (
+            <>
+              <div className="h-8 w-[1px] bg-zinc-800" />
+              <div className="text-right max-w-[200px]">
+                <span className="text-[10px] text-f1-red font-black tracking-wider block animate-pulse">
+                  📡 UPCOMING LIVE SESSION
+                </span>
+                <span className="font-bold text-white block text-xs truncate">
+                  {upcomingSession.eventName}
+                </span>
+                <span className="text-xs text-slate-400 font-mono block">
+                  {upcomingSession.sessionName}: <span className="text-yellow-400 font-bold">{countdownText}</span>
+                </span>
+              </div>
+            </>
+          )}
         </div>
       </header>
 
       {/* ==========================================
           MAIN LAYOUT CONTAINER
           ========================================== */}
-      <main className="flex-1 w-full max-w-7xl mx-auto px-4 py-6 flex flex-col lg:flex-row gap-6">
+      <main className="flex-1 w-full max-w-none px-6 py-6 flex flex-col lg:flex-row gap-6">
         
         {/* ==========================================
             LEFT SIDE: DYNAMIC STANDINGS LEADERBOARD
             ========================================== */}
-        <section className="flex-1 flex flex-col bg-f1-card border border-f1-border rounded-xl p-4 backdrop-blur-md">
+        <section className="flex-1 flex flex-col bg-f1-card border border-f1-border rounded-xl p-4 backdrop-blur-md overflow-x-auto">
           <div className="flex items-center justify-between mb-4 border-b border-zinc-800 pb-3">
             <div className="flex items-center gap-2">
               <span className="h-2.5 w-2.5 rounded-full bg-f1-red animate-ping" />
@@ -1073,7 +1278,7 @@ export default function Home() {
           </div>
 
           {/* Table Headers */}
-          <div className="flex items-center justify-between text-xs font-bold text-slate-400 uppercase px-4 mb-2 tracking-wider">
+          <div className="flex items-center justify-between text-xs font-bold text-slate-400 uppercase px-4 mb-2 tracking-wider min-w-[680px]">
             <div className="w-12 text-center">Pos</div>
             <div className="flex-1 px-4">Driver / Team</div>
             <div className="w-20 text-right">Gap</div>
@@ -1083,11 +1288,13 @@ export default function Home() {
             <div className="w-24 text-right">Controls</div>
           </div>
 
-          {/* Animated Reordering Rows Container */}
-          <div 
-            className="relative w-full transition-all duration-300"
-            style={{ height: `${22 * 66}px` }}
-          >
+          {/* Scrollable Body Container */}
+          <div className="overflow-y-auto flex-1 max-h-[720px] pr-1">
+            {/* Animated Reordering Rows Container */}
+            <div 
+              className="relative w-full transition-all duration-300 min-w-[680px]"
+              style={{ height: `${drivers.length * 66}px` }}
+            >
             {sortedDrivers.map((driver, index) => {
               // Row index styling
               const isPodium = index < 3;
@@ -1235,32 +1442,29 @@ export default function Home() {
                       {driver.points}
                     </div>
 
-                    {/* Override Controls */}
-                    <div className="w-24 flex items-center justify-end gap-1">
+                    {/* Override Controls (Disabled for Telemetry Mode) */}
+                    <div className="w-24 flex items-center justify-end gap-1 opacity-20" title="Telemetry Playback Mode">
                       <button
                         id={`btn-overtake-${driver.id}`}
-                        onClick={() => triggerManualOvertake(driver.id)}
-                        disabled={driver.dnf || index === 0}
-                        className="p-1 rounded bg-zinc-800 hover:bg-emerald-950 border border-zinc-700 hover:border-emerald-600 text-emerald-400 disabled:opacity-30 disabled:hover:bg-zinc-800 disabled:hover:border-zinc-700 transition-colors"
-                        title="Overtake Ahead"
+                        disabled={true}
+                        className="p-1 rounded bg-zinc-850 border border-zinc-800 text-zinc-600 cursor-not-allowed"
+                        title="Disabled in Playback"
                       >
                         <UpArrowIcon />
                       </button>
                       <button
                         id={`btn-drop-${driver.id}`}
-                        onClick={() => triggerManualDrop(driver.id)}
-                        disabled={driver.dnf || driver.position >= drivers.filter(d => !d.dnf).length}
-                        className="p-1 rounded bg-zinc-800 hover:bg-red-990 border border-zinc-700 hover:border-red-600 text-red-400 disabled:opacity-30 disabled:hover:bg-zinc-800 disabled:hover:border-zinc-700 transition-colors"
-                        title="Drop Behind"
+                        disabled={true}
+                        className="p-1 rounded bg-zinc-850 border border-zinc-800 text-zinc-600 cursor-not-allowed"
+                        title="Disabled in Playback"
                       >
                         <DownArrowIcon />
                       </button>
                       <button
                         id={`btn-dnf-${driver.id}`}
-                        onClick={() => triggerManualDNF(driver.id)}
-                        disabled={driver.dnf}
-                        className="px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-red-600 hover:text-white border border-zinc-700 text-slate-400 disabled:opacity-30 disabled:hover:bg-zinc-800 text-[10px] font-bold transition-all"
-                        title="Force DNF"
+                        disabled={true}
+                        className="px-1.5 py-0.5 rounded bg-zinc-850 border border-zinc-800 text-zinc-650 text-[10px] font-bold cursor-not-allowed"
+                        title="Disabled in Playback"
                       >
                         OUT
                       </button>
@@ -1270,6 +1474,7 @@ export default function Home() {
                 </div>
               );
             })}
+            </div>
           </div>
         </section>
 
@@ -1284,18 +1489,55 @@ export default function Home() {
               <span className="text-f1-red">⚡</span> Live Control Dashboard
             </h2>
 
-            {/* Circuit Selector */}
+            {/* Season & Session Selectors */}
+            <div className="grid grid-cols-2 gap-2 font-sans">
+              <div>
+                <label className="text-xs text-slate-400 block mb-1 font-semibold uppercase">Season Year</label>
+                <select
+                  id="select-year"
+                  value={selectedYear}
+                  onChange={(e) => setSelectedYear(parseInt(e.target.value))}
+                  disabled={isPlaying || isLoading}
+                  className="w-full bg-zinc-950 border border-zinc-800 text-slate-200 rounded px-2.5 py-1.5 text-sm focus:border-f1-red outline-none disabled:opacity-50 font-medium"
+                >
+                  {Array.from({ length: 9 }, (_, i) => 2018 + i).map(year => (
+                    <option key={year} value={year}>{year} Season</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-slate-400 block mb-1 font-semibold uppercase">Session Type</label>
+                <select
+                  id="select-session"
+                  value={selectedSessionType}
+                  onChange={(e) => setSelectedSessionType(e.target.value)}
+                  disabled={isPlaying || isLoading}
+                  className="w-full bg-zinc-950 border border-zinc-800 text-slate-200 rounded px-2.5 py-1.5 text-sm focus:border-f1-red outline-none disabled:opacity-50 font-medium"
+                >
+                  <option value="R">Race (R)</option>
+                  <option value="Q">Qualifying (Q)</option>
+                  <option value="S">Sprint (S)</option>
+                  <option value="FP1">Practice 1 (FP1)</option>
+                  <option value="FP2">Practice 2 (FP2)</option>
+                  <option value="FP3">Practice 3 (FP3)</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Grand Prix Selector */}
             <div>
-              <label className="text-xs text-slate-400 block mb-1 font-semibold uppercase">Track Circuit</label>
+              <label className="text-xs text-slate-400 block mb-1 font-semibold uppercase">Grand Prix Event</label>
               <select
-                id="select-track"
-                value={selectedTrack.name}
-                onChange={(e) => handleTrackChange(e.target.value)}
-                disabled={isPlaying}
-                className="w-full bg-zinc-950 border border-zinc-800 text-slate-200 rounded px-2.5 py-1.5 text-sm focus:border-f1-red outline-none disabled:opacity-50"
+                id="select-event"
+                value={selectedEventName}
+                onChange={(e) => setSelectedEventName(e.target.value)}
+                disabled={isPlaying || isLoading || scheduleEvents.length === 0}
+                className="w-full bg-zinc-950 border border-zinc-800 text-slate-200 rounded px-2.5 py-1.5 text-sm focus:border-f1-red outline-none disabled:opacity-50 font-medium"
               >
-                {TRACKS.map(t => (
-                  <option key={t.name} value={t.name}>{t.name}</option>
+                {scheduleEvents.map((event: any) => (
+                  <option key={event.EventName} value={event.EventName}>
+                    {event.EventName} ({event.Location})
+                  </option>
                 ))}
               </select>
             </div>
@@ -1305,7 +1547,7 @@ export default function Home() {
               <button
                 id="btn-play-simulation"
                 onClick={togglePlay}
-                disabled={isFinished}
+                disabled={isFinished || isLoading}
                 className={`flex-1 py-2 px-3 rounded font-bold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer
                   ${isPlaying 
                     ? 'bg-amber-600 text-black hover:bg-amber-500' 
@@ -1322,7 +1564,7 @@ export default function Home() {
                 ) : (
                   <>
                     <PlayIcon />
-                    <span>{lap > 0 ? 'Resume Sim' : 'Start Race'}</span>
+                    <span>{lap > 0 ? 'Resume Sim' : 'Start Playback'}</span>
                   </>
                 )}
               </button>
@@ -1330,7 +1572,8 @@ export default function Home() {
               <button
                 id="btn-reset-simulation"
                 onClick={handleReset}
-                className="p-2.5 rounded bg-zinc-800 border border-zinc-700 text-slate-300 hover:bg-zinc-700 transition-colors"
+                disabled={isLoading}
+                className="p-2.5 rounded bg-zinc-800 border border-zinc-700 text-slate-300 hover:bg-zinc-700 transition-colors disabled:opacity-50"
                 title="Reset Race"
               >
                 <ResetIcon />
@@ -1339,8 +1582,8 @@ export default function Home() {
 
             {/* Simulation speed multiplier */}
             <div>
-              <span className="text-xs text-slate-400 block mb-1 font-semibold uppercase">Simulation speed</span>
-              <div className="flex rounded border border-zinc-800 overflow-hidden text-xs">
+              <span className="text-xs text-slate-400 block mb-1 font-semibold uppercase">Playback speed</span>
+              <div className="flex rounded border border-zinc-800 overflow-hidden text-xs font-mono">
                 {([1, 2, 5] as const).map(s => (
                   <button
                     key={s}
@@ -1358,38 +1601,7 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Interactive Incident Buttons */}
-            <div className="grid grid-cols-3 gap-2 border-t border-zinc-800 pt-3 mt-1">
-              <button
-                id="btn-trigger-sc"
-                onClick={handleDeploySafetyCar}
-                disabled={!isPlaying || safetyCar !== 'None'}
-                className="py-1.5 px-2 bg-amber-500/10 border border-amber-500/30 hover:border-amber-400 hover:bg-amber-500/20 text-amber-400 text-xs font-bold rounded disabled:opacity-30 transition-all flex flex-col items-center justify-center gap-1"
-              >
-                <WarningIcon />
-                <span>Safety Car</span>
-              </button>
-              
-              <button
-                id="btn-trigger-rain"
-                onClick={handleTriggerRain}
-                disabled={!isPlaying || weather === 'Rainy'}
-                className="py-1.5 px-2 bg-blue-500/10 border border-blue-500/30 hover:border-blue-400 hover:bg-blue-500/20 text-blue-400 text-xs font-bold rounded disabled:opacity-30 transition-all flex flex-col items-center justify-center gap-1"
-              >
-                <RainIcon />
-                <span>Make Rain</span>
-              </button>
 
-              <button
-                id="btn-trigger-crash"
-                onClick={handleTriggerRandomCrash}
-                disabled={!isPlaying}
-                className="py-1.5 px-2 bg-red-500/10 border border-red-500/30 hover:border-red-400 hover:bg-red-500/20 text-red-400 text-xs font-bold rounded disabled:opacity-30 transition-all flex flex-col items-center justify-center gap-1"
-              >
-                <span>💥</span>
-                <span>Crash Car</span>
-              </button>
-            </div>
           </div>
 
           {/* Live Telemetry Progress Map */}
@@ -1487,8 +1699,51 @@ export default function Home() {
           ========================================== */}
       <footer className="mt-auto py-6 border-t border-zinc-900 bg-zinc-950 text-center text-xs text-slate-500 flex flex-col gap-1">
         <div>🏎️ Formula 1 Standings Dashboard Simulator</div>
-        <div>Created with React 19, Next.js and Tailwind CSS</div>
+        <div>Created by Uthira Muthu S P</div>
       </footer>
+
+      {/* Loading Overlay */}
+      {isLoading && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-[100] flex flex-col items-center justify-center gap-4 text-slate-100 font-sans">
+          <div className="relative w-16 h-16">
+            <div className="absolute inset-0 border-4 border-zinc-800 border-t-f1-red rounded-full animate-spin" />
+            <div className="absolute inset-2 bg-f1-red rounded-full flex items-center justify-center text-white font-black text-sm tracking-tighter skew-x-[-6deg] animate-pulse">
+              F1
+            </div>
+          </div>
+          <div className="text-center px-4 max-w-md">
+            <h3 className="font-bold text-lg text-white mb-1">Retrieving Telemetry</h3>
+            <p className="text-sm text-slate-400 font-mono animate-pulse">
+              {loadingProgress}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* API Connection Error Overlay */}
+      {apiError && (
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md z-[100] flex flex-col items-center justify-center gap-4 text-slate-100 px-6 text-center font-sans">
+          <div className="w-16 h-16 rounded-full bg-red-950/40 border border-red-500/30 flex items-center justify-center text-red-500 text-3xl">
+            ⚠️
+          </div>
+          <h3 className="font-bold text-xl text-white">Connection Error</h3>
+          <p className="text-sm text-slate-400 max-w-md bg-zinc-900 p-4 rounded-lg border border-zinc-800 font-mono">
+            {apiError}
+          </p>
+          <button
+            onClick={() => {
+              if (selectedEventName) {
+                loadRaceTelemetry(selectedYear, selectedEventName, selectedSessionType);
+              } else {
+                setSelectedYear(selectedYear); // re-trigger schedule fetch
+              }
+            }}
+            className="px-6 py-2 bg-f1-red hover:bg-red-500 text-white font-bold rounded-lg transition-colors cursor-pointer"
+          >
+            Retry Connection
+          </button>
+        </div>
+      )}
     </div>
   );
 }
